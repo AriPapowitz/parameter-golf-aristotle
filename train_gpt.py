@@ -90,6 +90,11 @@ class Hyperparameters:
     # Export quantization and compression
     export_bits = int(os.environ.get("EXPORT_BITS", 8))
     compressor = os.environ.get("COMPRESSOR", "zlib")
+    quant_clip_candidates = [
+        float(v) for v in os.environ.get(
+            "QUANT_CLIP_CANDIDATES", "0.995,0.999,0.9995,0.9999,0.999998"
+        ).split(",") if v.strip()
+    ]
 
     # Compression-aware training
     compression_reg_lambda = float(os.environ.get("COMPRESSION_REG_LAMBDA", 0.0))
@@ -333,45 +338,55 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
+def _clip_sweep_best(t32: Tensor, q_max: int, clip_qs: list[float]) -> tuple[Tensor, Tensor, int]:
+    """Try each clip percentile; return (q_float, scale, best_idx) with the lowest reconstruction MSE.
+    q_float contains rounded integer values but remains in float dtype (caller casts to int8/int32).
+    scale is 1D per-row (float32) for 2D tensors, 0D scalar (float32) for 1D/0D tensors.
+    """
+    if not clip_qs:
+        raise ValueError("clip_qs must be non-empty")
+    best_mse = float("inf")
+    best_q: Tensor | None = None
+    best_sc: Tensor | None = None
+    best_idx = 0
+    for i, cq in enumerate(clip_qs):
+        if t32.ndim == 2:
+            ca = (
+                torch.quantile(t32.abs(), cq, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            clipped = torch.maximum(torch.minimum(t32, ca[:, None]), -ca[:, None])
+            sc = (ca / q_max).clamp_min(1.0 / q_max)
+            q = torch.clamp(torch.round(clipped / sc[:, None]), -q_max, q_max)
+            dq = q * sc[:, None]
+        else:
+            ca_val = float(torch.quantile(t32.abs().flatten(), cq).item()) if t32.numel() else 0.0
+            sc_val = (ca_val / q_max) if ca_val > 0 else 1.0
+            sc = torch.tensor(sc_val, dtype=torch.float32)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca_val, ca_val) / sc_val), -q_max, q_max)
+            dq = q * sc_val
+        mse = float(((dq - t32) ** 2).mean().item()) if t32.numel() else 0.0
+        if mse < best_mse:
+            best_mse, best_q, best_sc, best_idx = mse, q, sc, i
+    assert best_q is not None and best_sc is not None
+    return best_q, best_sc, best_idx
+
+
+def quantize_float_tensor_int8(t: Tensor, clip_qs: list[float] | None = None) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    q, sc, _ = _clip_sweep_best(t32, 127, clip_qs if clip_qs else [INT8_CLIP_Q])
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+        return q.to(torch.int8).contiguous(), sc.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    return q.to(torch.int8).contiguous(), sc
 
 
-def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor, clip_qs: list[float] | None = None) -> tuple[Tensor, Tensor]:
     t32 = t.float()
+    q, sc, _ = _clip_sweep_best(t32, INT6_MAX, clip_qs if clip_qs else [INT8_CLIP_Q])
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / INT6_MAX).clamp_min(1.0 / INT6_MAX)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -INT6_MAX, INT6_MAX).to(torch.int32)
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / INT6_MAX if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX, INT6_MAX).to(torch.int32)
-    return q, scale
+        return q.to(torch.int32).contiguous(), sc.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    return q.to(torch.int32).contiguous(), sc
 
 
 def pack_int6_tensor(q: Tensor) -> Tensor:
@@ -439,7 +454,7 @@ def int6_quant_dequant_sanity() -> tuple[float, float]:
     err = (dq - t).abs()
     return float(err.mean().item()), float(err.max().item())
 
-def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8):
+def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: list[float] | None = None):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
@@ -447,6 +462,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8):
     # - passthrough for small float tensors, stored as fp16 to save bytes
     if bits not in (6, 8):
         raise ValueError(f"Unsupported export_bits={bits}; supported: 6, 8")
+    cqs = clip_qs if clip_qs else [INT8_CLIP_Q]
+    q_max = 127 if bits == 8 else INT6_MAX
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -457,6 +474,7 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "payload_bytes"),
         0,
     )
+    sweep_idx_sum = 0
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -479,23 +497,31 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8):
             continue
 
         stats["num_float_tensors"] += 1
+        q_float, s_raw, best_idx = _clip_sweep_best(t.float(), q_max, cqs)
+        sweep_idx_sum += best_idx
+        s = s_raw.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous() if s_raw.ndim > 0 else s_raw
+
         if bits == 6:
-            q_raw, s = quantize_float_tensor_int6(t)
+            q_raw = q_float.to(torch.int32).contiguous()
             packed = pack_int6_tensor(q_raw)
             qm: dict[str, object] = {"bits": 6, "numel": int(t.numel()), "shape": list(t.shape)}
-            if s.ndim > 0:
+            if s_raw.ndim > 0:
                 qm["scheme"] = "per_row"
             qmeta[name] = qm
             quantized[name] = packed
             stats["payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
         else:
-            q, s = quantize_float_tensor_int8(t)
-            if s.ndim > 0:
+            q = q_float.to(torch.int8).contiguous()
+            if s_raw.ndim > 0:
                 qmeta[name] = {"scheme": "per_row", "axis": 0}
             quantized[name] = q
             stats["payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
+
+    stats["sweep_candidates"] = len(cqs)
+    stats["sweep_tensors"] = stats["num_float_tensors"]
+    stats["sweep_avg_idx"] = sweep_idx_sum / max(stats["num_float_tensors"], 1)
 
     obj: dict[str, object] = {
         "__quant_format__": f"int{bits}_clean_per_row_v1",
@@ -1322,7 +1348,7 @@ def main() -> None:
         mae, max_abs = int6_quant_dequant_sanity()
         log0(f"int6_sanity pack_roundtrip:ok mae:{mae:.6e} max_abs:{max_abs:.6e}")
 
-    quant_obj, quant_stats = quantize_state_dict(base_model.state_dict(), args.export_bits)
+    quant_obj, quant_stats = quantize_state_dict(base_model.state_dict(), args.export_bits, args.quant_clip_candidates)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1339,6 +1365,12 @@ def main() -> None:
             f"Serialized model int{args.export_bits}+{args.compressor}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
+        if quant_stats["sweep_candidates"] > 1:
+            log0(
+                f"quant_sweep candidates:{quant_stats['sweep_candidates']} "
+                f"tensors:{quant_stats['sweep_tensors']} "
+                f"avg_best_idx:{quant_stats['sweep_avg_idx']:.2f}"
+            )
         log0(f"Total submission size int{args.export_bits}+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
