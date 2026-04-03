@@ -111,6 +111,13 @@ class Hyperparameters:
     quant_only_patterns = tuple(
         p for p in os.environ.get("QUANT_ONLY_PATTERNS", "").split(",") if p.strip()
     )
+    quant_bits_by_pattern = tuple(
+        (pat.strip(), int(b.strip()))
+        for rule in os.environ.get("QUANT_BITS_BY_PATTERN", "").split(",")
+        if rule.strip()
+        for pat, b in [rule.split(":", 1)]
+        if pat.strip() and b.strip()
+    )
 
     # Compression-aware training
     compression_reg_lambda = float(os.environ.get("COMPRESSION_REG_LAMBDA", 0.0))
@@ -576,7 +583,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
                         gptq_acts: dict[str, Tensor] | None = None, gptq_block_size: int = 128, gptq_damping: float = 1e-4,
                         quant_debug: bool = False, quant_skip_patterns: tuple[str, ...] = (),
                         quant_only_patterns: tuple[str, ...] = (), debug_log=None,
-                        gptq_export_debug: bool = False):
+                        gptq_export_debug: bool = False,
+                        quant_bits_by_pattern: tuple[tuple[str, int], ...] = ()):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
@@ -592,7 +600,6 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
         raise ValueError(f"Unsupported export_bits={bits}; supported: 6, 8")
     qlog = debug_log if debug_log is not None else print
     cqs = clip_qs if clip_qs else [INT8_CLIP_Q]
-    q_max = 127 if bits == 8 else INT6_MAX
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -616,6 +623,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     _sweep_q_bytes = 0
     _pass_bytes = 0
     _scale_bytes = 0
+    _int6_total_bytes = 0
+    _int8_total_bytes = 0
     _export_rows: list[tuple[int, str, str]] = []  # (bytes, name, bucket)
 
     for name, tensor in state_dict.items():
@@ -680,7 +689,17 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             continue
 
         stats["num_float_tensors"] += 1
-        use_gptq = bits == 6 and gptq_acts is not None and name in gptq_acts
+        chosen_bits = bits
+        bits_src = "default"
+        for pat, obits in quant_bits_by_pattern:
+            if pat in name:
+                chosen_bits = obits
+                bits_src = f"pattern:{pat}"
+                break
+        if chosen_bits not in (6, 8):
+            raise ValueError(f"Unsupported override bits={chosen_bits} for tensor {name}; supported: 6, 8")
+        q_max = 127 if chosen_bits == 8 else INT6_MAX
+        use_gptq = chosen_bits == 6 and gptq_acts is not None and name in gptq_acts
         if use_gptq:
             q_raw, s, best_idx = gptq_quantize_matrix_int6(t.float(), gptq_acts[name], gptq_block_size, gptq_damping, cqs)
             gptq_count += 1
@@ -690,7 +709,7 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             q_float, s_raw, best_idx = _clip_sweep_best(t.float(), q_max, cqs)
             sweep_idx_sum += best_idx
             s = s_raw.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous() if s_raw.ndim > 0 else s_raw
-            q_raw = q_float.to(torch.int32 if bits == 6 else torch.int8).contiguous()
+            q_raw = q_float.to(torch.int32 if chosen_bits == 6 else torch.int8).contiguous()
 
         s32 = s.to(dtype=torch.float32)
         if s.ndim > 0:
@@ -709,12 +728,12 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             clip_used = cqs[best_idx]
             axis = "per_row(axis=0)" if s.ndim > 0 else "per_tensor"
             qlog(
-                f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:quant bits:{bits} "
+                f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:quant bits:{chosen_bits} bits_src:{bits_src} "
                 f"clip:{clip_used:.6g} axis:{axis} scale_shape:{tuple(s.shape)} "
                 f"mse:{mse:.3e} mae:{mae:.3e} max_abs:{max_abs:.3e} rel_mse:{rel_mse:.3e}"
             )
 
-        if bits == 6:
+        if chosen_bits == 6:
             packed = pack_int6_tensor(q_raw)
             qm: dict[str, object] = {"bits": 6, "numel": int(t.numel()), "shape": list(t.shape)}
             if s.ndim > 0:
@@ -725,8 +744,10 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             _sb = tensor_nbytes(s)
             stats["payload_bytes"] += _qb + _sb
         else:
+            qmeta[name] = {"bits": 8}
             if s.ndim > 0:
-                qmeta[name] = {"scheme": "per_row", "axis": 0}
+                qmeta[name]["scheme"] = "per_row"
+                qmeta[name]["axis"] = 0
             quantized[name] = q_raw
             _qb = tensor_nbytes(q_raw)
             _sb = tensor_nbytes(s)
@@ -734,7 +755,11 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         _scale_bytes += _sb
-        _path = "gptq" if use_gptq else "sweep"
+        if chosen_bits == 6:
+            _int6_total_bytes += _qb + _sb
+        else:
+            _int8_total_bytes += _qb + _sb
+        _path = ("gptq" if use_gptq else "sweep") + f"_int{chosen_bits}"
         _export_rows.append((_qb + _sb, name, _path))
         if use_gptq:
             _gptq_q_bytes += _qb
@@ -745,7 +770,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             qlog(
                 f"gptq_export name:{name} bucket:{_path} orig_shape:{tuple(t.shape)} orig_dtype:{t.dtype} "
                 f"stored_type:{stored.dtype} stored_shape:{tuple(stored.shape)} "
-                f"q_bytes:{_qb} s_bytes:{_sb} scale_shape:{tuple(s.shape)} total:{_qb+_sb}"
+                f"q_bytes:{_qb} s_bytes:{_sb} scale_shape:{tuple(s.shape)} total:{_qb+_sb} "
+                f"chosen_bits:{chosen_bits} bits_src:{bits_src}"
             )
 
     stats["sweep_candidates"] = len(cqs)
@@ -759,6 +785,9 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     stats["export_sweep_q_bytes"] = _sweep_q_bytes
     stats["export_pass_bytes"] = _pass_bytes
     stats["export_scale_bytes"] = _scale_bytes
+    stats["export_int6_bytes"] = _int6_total_bytes
+    stats["export_int8_bytes"] = _int8_total_bytes
+    stats["export_passthrough_bytes"] = _pass_bytes
     top10_bytes = sorted(_export_rows, key=lambda x: x[0], reverse=True)[:10]
     stats["export_top10_bytes"] = ";".join(f"{bucket}/{name}:{nb}" for nb, name, bucket in top10_bytes)
 
@@ -1619,7 +1648,7 @@ def main() -> None:
         base_model.state_dict(), args.export_bits, args.quant_clip_candidates,
         gptq_acts or None, args.gptq_block_size, args.gptq_damping,
         args.quant_debug, args.quant_skip_patterns, args.quant_only_patterns, log0,
-        args.gptq_export_debug,
+        args.gptq_export_debug, args.quant_bits_by_pattern,
     )
     # ---- pre-save byte audit (always printed, component breakdown is cheap) ----
     _obj_q_bytes = sum(tensor_nbytes(v) for v in quant_obj["quantized"].values())
@@ -1680,6 +1709,11 @@ def main() -> None:
             f"quantized_params:{quant_stats['quantized_params']} "
             f"skipped_params:{quant_stats['skipped_params']} "
             f"worst_rel_mse_top10:{quant_stats['worst_rel_mse_top10']}"
+        )
+        log0(
+            f"quant_bytes_by_bits int6:{quant_stats['export_int6_bytes']} "
+            f"int8:{quant_stats['export_int8_bytes']} "
+            f"passthrough:{quant_stats['export_passthrough_bytes']}"
         )
         log0(f"Total submission size int{args.export_bits}+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
