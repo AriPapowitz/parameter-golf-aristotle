@@ -102,6 +102,14 @@ class Hyperparameters:
             "QUANT_CLIP_CANDIDATES", "0.995,0.999,0.9995,0.9999,0.999998"
         ).split(",") if v.strip()
     ]
+    quant_debug = bool(int(os.environ.get("QUANT_DEBUG", "0")))
+    quant_logit_debug = bool(int(os.environ.get("QUANT_LOGIT_DEBUG", "0")))
+    quant_skip_patterns = tuple(
+        p for p in os.environ.get("QUANT_SKIP_PATTERNS", "").split(",") if p.strip()
+    )
+    quant_only_patterns = tuple(
+        p for p in os.environ.get("QUANT_ONLY_PATTERNS", "").split(",") if p.strip()
+    )
 
     # Compression-aware training
     compression_reg_lambda = float(os.environ.get("COMPRESSION_REG_LAMBDA", 0.0))
@@ -303,6 +311,28 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+
+def forward_logits(model: "GPT", input_ids: Tensor) -> Tensor:
+    x = model.tok_emb(input_ids)
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+    for i in range(model.num_encoder_layers):
+        x = model.blocks[i](x, x0)
+        skips.append(x)
+    for i in range(model.num_decoder_layers):
+        if skips:
+            x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        x = model.blocks[model.num_encoder_layers + i](x, x0)
+    x = model.final_norm(x).reshape(-1, x.size(-1))
+    if model.tie_embeddings:
+        logits_proj = F.linear(x, model.tok_emb.weight)
+    else:
+        if model.lm_head is None:
+            raise RuntimeError("lm_head is required when tie_embeddings=False")
+        logits_proj = model.lm_head(x)
+    return model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -471,7 +501,7 @@ def should_target_for_gptq(name: str, param: Tensor, target: str) -> bool:
 
 def gptq_quantize_matrix_int6(
     weight: Tensor, acts: Tensor, block_size: int, damping: float, clip_qs: list[float],
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, int]:
     """GPTQ int6 for weight:[out,in] with activations acts:[N,in]. Returns (q_int32, scale_fp16)."""
     W, X = weight.detach().float(), acts.float()
     out_f, in_f = W.shape
@@ -481,7 +511,8 @@ def gptq_quantize_matrix_int6(
         H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
     except torch.linalg.LinAlgError:
         H_inv = torch.linalg.pinv(H)
-    scale = _clip_sweep_best(W, INT6_MAX, clip_qs)[1].clamp_min(1.0 / INT6_MAX)
+    _, scale, best_idx = _clip_sweep_best(W, INT6_MAX, clip_qs)
+    scale = scale.clamp_min(1.0 / INT6_MAX)
     W_upd, Q = W.clone(), torch.zeros(out_f, in_f, dtype=torch.int32)
     for bs in range(0, in_f, block_size):
         be = min(bs + block_size, in_f)
@@ -495,7 +526,7 @@ def gptq_quantize_matrix_int6(
                 W_upd[:, j+1:be] -= err_j[:, None] * (H_inv[j, j+1:be] / h_jj)
         if be < in_f:
             W_upd[:, be:] -= (err_b / H_inv.diagonal()[bs:be].clamp_min(1e-10)) @ H_inv[bs:be, be:]
-    return Q.contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    return Q.contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), best_idx
 
 
 def _collect_calibration_acts(
@@ -541,14 +572,23 @@ def _collect_calibration_acts(
 
 
 def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: list[float] | None = None,
-                        gptq_acts: dict[str, Tensor] | None = None, gptq_block_size: int = 128, gptq_damping: float = 1e-4):
+                        gptq_acts: dict[str, Tensor] | None = None, gptq_block_size: int = 128, gptq_damping: float = 1e-4,
+                        quant_debug: bool = False, quant_skip_patterns: tuple[str, ...] = (),
+                        quant_only_patterns: tuple[str, ...] = (), debug_log=None):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
+    #
+    # Quantization note for nn.Linear:
+    # - expected weight shape is [out_features, in_features]
+    # - "per-row" means one scale per output row (shape [out_features])
+    # - dequant uses q * scale[:, None], i.e. broadcast across input columns
+    # - clip sweep chooses the percentile with the lowest reconstruction MSE
     if bits not in (6, 8):
         raise ValueError(f"Unsupported export_bits={bits}; supported: 6, 8")
+    qlog = debug_log if debug_log is not None else print
     cqs = clip_qs if clip_qs else [INT8_CLIP_Q]
     q_max = 127 if bits == 8 else INT6_MAX
     quantized: dict[str, Tensor] = {}
@@ -563,6 +603,12 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     )
     sweep_idx_sum = 0
     gptq_count = 0
+    stats["quantized_tensors"] = 0
+    stats["skipped_tensors"] = 0
+    stats["quantized_params"] = 0
+    stats["skipped_params"] = 0
+    worst_rel_mse: list[tuple[float, str]] = []
+    gptq_names: list[str] = []
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -574,6 +620,26 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["payload_bytes"] += tensor_nbytes(t)
+            stats["skipped_tensors"] += 1
+            stats["skipped_params"] += int(t.numel())
+            if quant_debug:
+                qlog(
+                    f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_nonfloat bits:{bits}"
+                )
+            continue
+
+        only_ok = (not quant_only_patterns) or any(p in name for p in quant_only_patterns)
+        skip_hit = any(p in name for p in quant_skip_patterns)
+        if (not only_ok) or skip_hit:
+            passthrough[name] = t
+            stats["payload_bytes"] += tensor_nbytes(t)
+            stats["skipped_tensors"] += 1
+            stats["skipped_params"] += int(t.numel())
+            if quant_debug:
+                reason = "skip_pattern" if skip_hit else "only_filter"
+                qlog(
+                    f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_{reason} bits:{bits}"
+                )
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -582,18 +648,48 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["payload_bytes"] += tensor_nbytes(kept)
+            stats["skipped_tensors"] += 1
+            stats["skipped_params"] += int(t.numel())
+            if quant_debug:
+                qlog(
+                    f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_small bits:{bits}"
+                )
             continue
 
         stats["num_float_tensors"] += 1
         use_gptq = bits == 6 and gptq_acts is not None and name in gptq_acts
         if use_gptq:
-            q_raw, s = gptq_quantize_matrix_int6(t.float(), gptq_acts[name], gptq_block_size, gptq_damping, cqs)
+            q_raw, s, best_idx = gptq_quantize_matrix_int6(t.float(), gptq_acts[name], gptq_block_size, gptq_damping, cqs)
             gptq_count += 1
+            if len(gptq_names) < 5:
+                gptq_names.append(name)
         else:
             q_float, s_raw, best_idx = _clip_sweep_best(t.float(), q_max, cqs)
             sweep_idx_sum += best_idx
             s = s_raw.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous() if s_raw.ndim > 0 else s_raw
             q_raw = q_float.to(torch.int32 if bits == 6 else torch.int8).contiguous()
+
+        s32 = s.to(dtype=torch.float32)
+        if s.ndim > 0:
+            dq = q_raw.float() * s32.view(q_raw.shape[0], *([1] * (q_raw.ndim - 1)))
+        else:
+            dq = q_raw.float() * float(s32.item())
+        err = dq - t.float()
+        mse = float((err.square().mean()).item()) if err.numel() else 0.0
+        mae = float(err.abs().mean().item()) if err.numel() else 0.0
+        max_abs = float(err.abs().max().item()) if err.numel() else 0.0
+        rel_mse = mse / (float((t.float().square().mean()).item()) + 1e-12)
+        worst_rel_mse.append((rel_mse, name))
+        stats["quantized_tensors"] += 1
+        stats["quantized_params"] += int(t.numel())
+        if quant_debug:
+            clip_used = cqs[best_idx]
+            axis = "per_row(axis=0)" if s.ndim > 0 else "per_tensor"
+            qlog(
+                f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:quant bits:{bits} "
+                f"clip:{clip_used:.6g} axis:{axis} scale_shape:{tuple(s.shape)} "
+                f"mse:{mse:.3e} mae:{mae:.3e} max_abs:{max_abs:.3e} rel_mse:{rel_mse:.3e}"
+            )
 
         if bits == 6:
             packed = pack_int6_tensor(q_raw)
@@ -615,6 +711,9 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     stats["sweep_tensors"] = stats["num_float_tensors"]
     stats["sweep_avg_idx"] = sweep_idx_sum / max(stats["num_float_tensors"], 1)
     stats["gptq_count"] = gptq_count
+    stats["gptq_names"] = gptq_names
+    top = sorted(worst_rel_mse, key=lambda x: x[0], reverse=True)[:10]
+    stats["worst_rel_mse_top10"] = ",".join(f"{n}:{v:.3e}" for v, n in top) if top else "none"
 
     obj: dict[str, object] = {
         "__quant_format__": f"int{bits}_clean_per_row_v1",
@@ -1441,6 +1540,15 @@ def main() -> None:
         mae, max_abs = int6_quant_dequant_sanity()
         log0(f"int6_sanity pack_roundtrip:ok mae:{mae:.6e} max_abs:{max_abs:.6e}")
 
+    logit_dbg_x: Tensor | None = None
+    logit_dbg_fp: Tensor | None = None
+    if args.quant_logit_debug:
+        local = val_tokens[: args.train_seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+        logit_dbg_x = local[:-1].reshape(-1, args.train_seq_len)[:1]
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logit_dbg_fp = forward_logits(base_model, logit_dbg_x).float().cpu()
+
     gptq_acts: dict[str, Tensor] = {}
     if args.export_bits == 6 and args.gptq_enable:
         gptq_acts = _collect_calibration_acts(base_model, train_loader, args, grad_accum_steps)
@@ -1454,6 +1562,7 @@ def main() -> None:
     quant_obj, quant_stats = quantize_state_dict(
         base_model.state_dict(), args.export_bits, args.quant_clip_candidates,
         gptq_acts or None, args.gptq_block_size, args.gptq_damping,
+        args.quant_debug, args.quant_skip_patterns, args.quant_only_patterns, log0,
     )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
@@ -1479,6 +1588,15 @@ def main() -> None:
             )
         if quant_stats.get("gptq_count", 0) > 0:
             log0(f"gptq_quant tensors:{quant_stats['gptq_count']}")
+            if quant_stats.get("gptq_names"):
+                log0(f"gptq_quant_preview:{','.join(quant_stats['gptq_names'])}")
+        log0(
+            f"quant_summary quantized_tensors:{quant_stats['quantized_tensors']} "
+            f"skipped_tensors:{quant_stats['skipped_tensors']} "
+            f"quantized_params:{quant_stats['quantized_params']} "
+            f"skipped_params:{quant_stats['skipped_params']} "
+            f"worst_rel_mse_top10:{quant_stats['worst_rel_mse_top10']}"
+        )
         log0(f"Total submission size int{args.export_bits}+{args.compressor}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
@@ -1487,6 +1605,16 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_bytes(quant_blob_disk, args.compressor)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
+    if args.quant_logit_debug and logit_dbg_x is not None and logit_dbg_fp is not None:
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logit_dbg_q = forward_logits(base_model, logit_dbg_x).float()
+        logit_diff = logit_dbg_q - logit_dbg_fp.to(device)
+        log0(
+            f"quant_logit_debug mae:{logit_diff.abs().mean().item():.3e} "
+            f"max_abs:{logit_diff.abs().max().item():.3e} "
+            f"mse:{(logit_diff.square().mean()).item():.3e}"
+        )
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
