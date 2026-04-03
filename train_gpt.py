@@ -93,6 +93,8 @@ class Hyperparameters:
     # GPTQ-lite calibration (int6 only, disabled by default)
     gptq_enable = bool(int(os.environ.get("GPTQ_ENABLE", "0")))
     gptq_targets = os.environ.get("GPTQ_TARGETS", "mlp")
+    gptq_target_list = tuple(t.strip() for t in gptq_targets.split(",") if t.strip())
+    gptq_target_debug = bool(int(os.environ.get("GPTQ_TARGET_DEBUG", "0")))
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 16))
     gptq_max_rows = int(os.environ.get("GPTQ_MAX_ROWS", 4096))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -499,12 +501,34 @@ def int6_quant_dequant_sanity() -> tuple[float, float]:
     err = (dq - t).abs()
     return float(err.mean().item()), float(err.max().item())
 
+def gptq_target_match(name: str, param: Tensor, targets: tuple[str, ...]) -> tuple[bool, str]:
+    if param.ndim != 2:
+        return False, "not_2d"
+    if param.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        return False, "too_small"
+    ts = targets if targets else ("mlp",)
+    if "all" in ts:
+        return True, "all"
+    if "mlp" in ts and (("mlp.fc.weight" in name) or ("mlp.proj.weight" in name)):
+        return True, "keyword:mlp"
+    if "attn" in ts and (
+        ("attn.c_q.weight" in name)
+        or ("attn.c_k.weight" in name)
+        or ("attn.c_v.weight" in name)
+        or ("attn.proj.weight" in name)
+    ):
+        return True, "keyword:attn"
+    for tok in ts:
+        if tok in {"mlp", "attn", "all"}:
+            continue
+        if tok in name:
+            return True, f"substr:{tok}"
+    return False, "no_target_match"
+
+
 def should_target_for_gptq(name: str, param: Tensor, target: str) -> bool:
-    if param.ndim != 2 or param.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-        return False
-    if target == "mlp":
-        return ("mlp.fc.weight" in name) or ("mlp.proj.weight" in name)
-    return target == "all"
+    targets = tuple(t.strip() for t in target.split(",") if t.strip())
+    return gptq_target_match(name, param, targets)[0]
 
 
 def gptq_quantize_matrix_int6(
@@ -539,11 +563,14 @@ def gptq_quantize_matrix_int6(
 
 def _collect_calibration_acts(
     base_model: nn.Module, train_loader: DistributedTokenLoader,
-    args: Hyperparameters, grad_accum_steps: int,
-) -> dict[str, Tensor]:
+    args: Hyperparameters, grad_accum_steps: int, log_fn=None,
+) -> tuple[dict[str, Tensor], int, int]:
     bufs: dict[str, Tensor] = {}
     hooks = []
     gen = torch.Generator().manual_seed(args.seed + 1337)
+    tlog = log_fn if log_fn is not None else print
+    matched = 0
+    unmatched = 0
 
     def _append_capped(name: str, x: Tensor) -> None:
         rows = x.detach().float().cpu().reshape(-1, x.shape[-1])
@@ -562,11 +589,21 @@ def _collect_calibration_acts(
 
     for n, m in base_model.named_modules():
         pn = f"{n}.weight"
-        if isinstance(m, nn.Linear) and should_target_for_gptq(pn, m.weight, args.gptq_targets):
-            hooks.append(m.register_forward_hook(
-                lambda _, inp, __, _pn=pn: _append_capped(_pn, inp[0])))
+        if isinstance(m, nn.Linear):
+            ok, reason = gptq_target_match(pn, m.weight, args.gptq_target_list)
+            if args.gptq_target_debug:
+                tlog(
+                    f"gptq_target_debug name:{pn} enabled:{args.gptq_enable} targets:{args.gptq_target_list} "
+                    f"matched:{ok} reason:{reason} route:{'gptq_calib' if ok else 'not_targeted'}"
+                )
+            if ok:
+                matched += 1
+                hooks.append(m.register_forward_hook(
+                    lambda _, inp, __, _pn=pn: _append_capped(_pn, inp[0])))
+            else:
+                unmatched += 1
     if not hooks:
-        return {}
+        return {}, matched, unmatched
     base_model.eval()
     with torch.inference_mode():
         for _ in range(args.gptq_calib_batches):
@@ -576,7 +613,7 @@ def _collect_calibration_acts(
     base_model.train()
     for h in hooks:
         h.remove()
-    return bufs
+    return bufs, matched, unmatched
 
 
 def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: list[float] | None = None,
@@ -584,7 +621,9 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
                         quant_debug: bool = False, quant_skip_patterns: tuple[str, ...] = (),
                         quant_only_patterns: tuple[str, ...] = (), debug_log=None,
                         gptq_export_debug: bool = False,
-                        quant_bits_by_pattern: tuple[tuple[str, int], ...] = ()):
+                        quant_bits_by_pattern: tuple[tuple[str, int], ...] = (),
+                        gptq_enabled: bool = False, gptq_target_list: tuple[str, ...] = (),
+                        gptq_target_debug: bool = False):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
@@ -626,6 +665,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     _int6_total_bytes = 0
     _int8_total_bytes = 0
     _export_rows: list[tuple[int, str, str]] = []  # (bytes, name, bucket)
+    gptq_target_matched = 0
+    gptq_target_unmatched = 0
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -689,6 +730,11 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
             continue
 
         stats["num_float_tensors"] += 1
+        tgt_ok, tgt_reason = gptq_target_match(name, t, gptq_target_list)
+        if tgt_ok:
+            gptq_target_matched += 1
+        else:
+            gptq_target_unmatched += 1
         chosen_bits = bits
         bits_src = "default"
         for pat, obits in quant_bits_by_pattern:
@@ -699,7 +745,21 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
         if chosen_bits not in (6, 8):
             raise ValueError(f"Unsupported override bits={chosen_bits} for tensor {name}; supported: 6, 8")
         q_max = 127 if chosen_bits == 8 else INT6_MAX
-        use_gptq = chosen_bits == 6 and gptq_acts is not None and name in gptq_acts
+        use_gptq = bool(gptq_enabled and chosen_bits == 6 and tgt_ok and gptq_acts is not None and name in gptq_acts)
+        route_reason = "gptq" if use_gptq else "sweep"
+        if gptq_enabled and tgt_ok and chosen_bits != 6:
+            route_reason = f"fallback:int{chosen_bits}_not_supported_for_gptq"
+        elif gptq_enabled and tgt_ok and (gptq_acts is None or name not in gptq_acts):
+            route_reason = "fallback:no_calibration_acts"
+        elif gptq_enabled and not tgt_ok:
+            route_reason = f"fallback:not_targeted({tgt_reason})"
+        elif not gptq_enabled:
+            route_reason = "fallback:gptq_disabled"
+        if gptq_target_debug:
+            qlog(
+                f"gptq_target_debug name:{name} enabled:{gptq_enabled} targets:{gptq_target_list} "
+                f"matched:{tgt_ok} reason:{tgt_reason} chosen_bits:{chosen_bits} bits_src:{bits_src} route:{route_reason}"
+            )
         if use_gptq:
             q_raw, s, best_idx = gptq_quantize_matrix_int6(t.float(), gptq_acts[name], gptq_block_size, gptq_damping, cqs)
             gptq_count += 1
@@ -779,6 +839,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     stats["sweep_avg_idx"] = sweep_idx_sum / max(stats["num_float_tensors"], 1)
     stats["gptq_count"] = gptq_count
     stats["gptq_names"] = gptq_names
+    stats["gptq_target_matched"] = gptq_target_matched
+    stats["gptq_target_unmatched"] = gptq_target_unmatched
     top = sorted(worst_rel_mse, key=lambda x: x[0], reverse=True)[:10]
     stats["worst_rel_mse_top10"] = ",".join(f"{n}:{v:.3e}" for v, n in top) if top else "none"
     stats["export_gptq_q_bytes"] = _gptq_q_bytes
@@ -1635,8 +1697,12 @@ def main() -> None:
                 logit_dbg_fp = forward_logits(base_model, logit_dbg_x).float().cpu()
 
     gptq_acts: dict[str, Tensor] = {}
+    gptq_calib_matched = 0
+    gptq_calib_unmatched = 0
     if args.export_bits == 6 and args.gptq_enable:
-        gptq_acts = _collect_calibration_acts(base_model, train_loader, args, grad_accum_steps)
+        gptq_acts, gptq_calib_matched, gptq_calib_unmatched = _collect_calibration_acts(
+            base_model, train_loader, args, grad_accum_steps, log0
+        )
         if gptq_acts:
             row_counts = [int(v.shape[0]) for v in gptq_acts.values()]
             preview = ", ".join(f"{k}:{int(v.shape[0])}" for k, v in list(gptq_acts.items())[:3])
@@ -1649,6 +1715,7 @@ def main() -> None:
         gptq_acts or None, args.gptq_block_size, args.gptq_damping,
         args.quant_debug, args.quant_skip_patterns, args.quant_only_patterns, log0,
         args.gptq_export_debug, args.quant_bits_by_pattern,
+        args.gptq_enable, args.gptq_target_list, args.gptq_target_debug,
     )
     # ---- pre-save byte audit (always printed, component breakdown is cheap) ----
     _obj_q_bytes = sum(tensor_nbytes(v) for v in quant_obj["quantized"].values())
@@ -1699,10 +1766,12 @@ def main() -> None:
                 f"tensors:{quant_stats['sweep_tensors']} "
                 f"avg_best_idx:{quant_stats['sweep_avg_idx']:.2f}"
             )
-        if quant_stats.get("gptq_count", 0) > 0:
-            log0(f"gptq_quant tensors:{quant_stats['gptq_count']}")
-            if quant_stats.get("gptq_names"):
-                log0(f"gptq_quant_preview:{','.join(quant_stats['gptq_names'])}")
+        log0(f"gptq_target_summary matched:{quant_stats.get('gptq_target_matched', 0)} unmatched:{quant_stats.get('gptq_target_unmatched', 0)}")
+        log0(f"gptq_quant tensors:{quant_stats.get('gptq_count', 0)}")
+        if quant_stats.get("gptq_names"):
+            log0(f"gptq_quant_preview:{','.join(quant_stats['gptq_names'])}")
+        if args.gptq_enable and args.gptq_target_debug:
+            log0(f"gptq_calib_target_summary matched:{gptq_calib_matched} unmatched:{gptq_calib_unmatched}")
         log0(
             f"quant_summary quantized_tensors:{quant_stats['quantized_tensors']} "
             f"skipped_tensors:{quant_stats['skipped_tensors']} "
