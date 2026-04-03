@@ -104,6 +104,7 @@ class Hyperparameters:
     ]
     quant_debug = bool(int(os.environ.get("QUANT_DEBUG", "0")))
     quant_logit_debug = bool(int(os.environ.get("QUANT_LOGIT_DEBUG", "0")))
+    gptq_export_debug = bool(int(os.environ.get("GPTQ_EXPORT_DEBUG", "0")))
     quant_skip_patterns = tuple(
         p for p in os.environ.get("QUANT_SKIP_PATTERNS", "").split(",") if p.strip()
     )
@@ -574,7 +575,8 @@ def _collect_calibration_acts(
 def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: list[float] | None = None,
                         gptq_acts: dict[str, Tensor] | None = None, gptq_block_size: int = 128, gptq_damping: float = 1e-4,
                         quant_debug: bool = False, quant_skip_patterns: tuple[str, ...] = (),
-                        quant_only_patterns: tuple[str, ...] = (), debug_log=None):
+                        quant_only_patterns: tuple[str, ...] = (), debug_log=None,
+                        gptq_export_debug: bool = False):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
@@ -609,6 +611,12 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     stats["skipped_params"] = 0
     worst_rel_mse: list[tuple[float, str]] = []
     gptq_names: list[str] = []
+    # byte-level accounting (filled when gptq_export_debug=True or always for summary)
+    _gptq_q_bytes = 0
+    _sweep_q_bytes = 0
+    _pass_bytes = 0
+    _scale_bytes = 0
+    _export_rows: list[tuple[int, str, str]] = []  # (bytes, name, bucket)
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -619,27 +627,37 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
-            stats["payload_bytes"] += tensor_nbytes(t)
+            _nb = tensor_nbytes(t)
+            stats["payload_bytes"] += _nb
             stats["skipped_tensors"] += 1
             stats["skipped_params"] += int(t.numel())
+            _pass_bytes += _nb
+            _export_rows.append((_nb, name, "pass_nonfloat"))
             if quant_debug:
                 qlog(
                     f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_nonfloat bits:{bits}"
                 )
+            if gptq_export_debug:
+                qlog(f"gptq_export name:{name} bucket:pass_nonfloat shape:{tuple(t.shape)} dtype:{t.dtype} bytes:{_nb}")
             continue
 
         only_ok = (not quant_only_patterns) or any(p in name for p in quant_only_patterns)
         skip_hit = any(p in name for p in quant_skip_patterns)
         if (not only_ok) or skip_hit:
             passthrough[name] = t
-            stats["payload_bytes"] += tensor_nbytes(t)
+            _nb = tensor_nbytes(t)
+            stats["payload_bytes"] += _nb
             stats["skipped_tensors"] += 1
             stats["skipped_params"] += int(t.numel())
+            _pass_bytes += _nb
+            reason = "skip_pattern" if skip_hit else "only_filter"
+            _export_rows.append((_nb, name, f"pass_{reason}"))
             if quant_debug:
-                reason = "skip_pattern" if skip_hit else "only_filter"
                 qlog(
                     f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_{reason} bits:{bits}"
                 )
+            if gptq_export_debug:
+                qlog(f"gptq_export name:{name} bucket:pass_{reason} shape:{tuple(t.shape)} dtype:{t.dtype} bytes:{_nb}")
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -647,13 +665,18 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
-            stats["payload_bytes"] += tensor_nbytes(kept)
+            _nb = tensor_nbytes(kept)
+            stats["payload_bytes"] += _nb
             stats["skipped_tensors"] += 1
             stats["skipped_params"] += int(t.numel())
+            _pass_bytes += _nb
+            _export_rows.append((_nb, name, "pass_small"))
             if quant_debug:
                 qlog(
                     f"quant_debug name:{name} shape:{tuple(t.shape)} dtype:{t.dtype} action:skip_small bits:{bits}"
                 )
+            if gptq_export_debug:
+                qlog(f"gptq_export name:{name} bucket:pass_small shape:{tuple(t.shape)} dtype:{t.dtype} stored_bytes:{_nb}")
             continue
 
         stats["num_float_tensors"] += 1
@@ -698,14 +721,32 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
                 qm["scheme"] = "per_row"
             qmeta[name] = qm
             quantized[name] = packed
-            stats["payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+            _qb = tensor_nbytes(packed)
+            _sb = tensor_nbytes(s)
+            stats["payload_bytes"] += _qb + _sb
         else:
             if s.ndim > 0:
                 qmeta[name] = {"scheme": "per_row", "axis": 0}
             quantized[name] = q_raw
-            stats["payload_bytes"] += tensor_nbytes(q_raw) + tensor_nbytes(s)
+            _qb = tensor_nbytes(q_raw)
+            _sb = tensor_nbytes(s)
+            stats["payload_bytes"] += _qb + _sb
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
+        _scale_bytes += _sb
+        _path = "gptq" if use_gptq else "sweep"
+        _export_rows.append((_qb + _sb, name, _path))
+        if use_gptq:
+            _gptq_q_bytes += _qb
+        else:
+            _sweep_q_bytes += _qb
+        if gptq_export_debug:
+            stored = quantized[name]
+            qlog(
+                f"gptq_export name:{name} bucket:{_path} orig_shape:{tuple(t.shape)} orig_dtype:{t.dtype} "
+                f"stored_type:{stored.dtype} stored_shape:{tuple(stored.shape)} "
+                f"q_bytes:{_qb} s_bytes:{_sb} scale_shape:{tuple(s.shape)} total:{_qb+_sb}"
+            )
 
     stats["sweep_candidates"] = len(cqs)
     stats["sweep_tensors"] = stats["num_float_tensors"]
@@ -714,6 +755,12 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
     stats["gptq_names"] = gptq_names
     top = sorted(worst_rel_mse, key=lambda x: x[0], reverse=True)[:10]
     stats["worst_rel_mse_top10"] = ",".join(f"{n}:{v:.3e}" for v, n in top) if top else "none"
+    stats["export_gptq_q_bytes"] = _gptq_q_bytes
+    stats["export_sweep_q_bytes"] = _sweep_q_bytes
+    stats["export_pass_bytes"] = _pass_bytes
+    stats["export_scale_bytes"] = _scale_bytes
+    top10_bytes = sorted(_export_rows, key=lambda x: x[0], reverse=True)[:10]
+    stats["export_top10_bytes"] = ";".join(f"{bucket}/{name}:{nb}" for nb, name, bucket in top10_bytes)
 
     obj: dict[str, object] = {
         "__quant_format__": f"int{bits}_clean_per_row_v1",
@@ -1572,7 +1619,35 @@ def main() -> None:
         base_model.state_dict(), args.export_bits, args.quant_clip_candidates,
         gptq_acts or None, args.gptq_block_size, args.gptq_damping,
         args.quant_debug, args.quant_skip_patterns, args.quant_only_patterns, log0,
+        args.gptq_export_debug,
     )
+    # ---- pre-save byte audit (always printed, component breakdown is cheap) ----
+    _obj_q_bytes = sum(tensor_nbytes(v) for v in quant_obj["quantized"].values())
+    _obj_s_bytes = sum(tensor_nbytes(v) for v in quant_obj["scales"].values())
+    _obj_p_bytes = sum(tensor_nbytes(v) for v in quant_obj["passthrough"].values())
+    log0(
+        f"export_obj_bytes quantized:{_obj_q_bytes} scales:{_obj_s_bytes} passthrough:{_obj_p_bytes} "
+        f"total_tensors:{_obj_q_bytes + _obj_s_bytes + _obj_p_bytes} "
+        f"gptq_q:{quant_stats['export_gptq_q_bytes']} sweep_q:{quant_stats['export_sweep_q_bytes']}"
+    )
+    log0(f"export_top10 {quant_stats['export_top10_bytes']}")
+    if args.gptq_export_debug:
+        # Per-section passthrough breakdown
+        for _pn, _pt in list(quant_obj["passthrough"].items()):
+            if tensor_nbytes(_pt) > 100_000:
+                log0(f"gptq_export_pass_large name:{_pn} shape:{tuple(_pt.shape)} dtype:{_pt.dtype} bytes:{tensor_nbytes(_pt)}")
+        # Representative GPTQ tensor round-trip inspection
+        _rep_key = next((k for k in quant_obj["quantized"] if "mlp.fc.weight" in k), None)
+        if _rep_key and _rep_key in quant_obj.get("qmeta", {}):
+            _rq = quant_obj["quantized"][_rep_key]
+            _rs = quant_obj["scales"][_rep_key]
+            _rm = quant_obj["qmeta"][_rep_key]
+            log0(
+                f"gptq_export_roundtrip_inspect key:{_rep_key} "
+                f"stored_q_dtype:{_rq.dtype} stored_q_shape:{tuple(_rq.shape)} "
+                f"stored_s_dtype:{_rs.dtype} stored_s_shape:{tuple(_rs.shape)} "
+                f"meta:{_rm}"
+            )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
