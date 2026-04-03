@@ -376,29 +376,68 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
 
 def pack_int6_tensor(q: Tensor) -> Tensor:
     """Pack int32 tensor of int6 values [-31, 31] into uint8 bytes (4 values per 3 bytes)."""
-    flat = q.reshape(-1).numpy().astype(np.int32)
-    u = (flat + INT6_MAX).astype(np.uint8)  # shift to [0, 62], fits in 6 bits
+    q32 = q.detach().to("cpu", dtype=torch.int32).contiguous()
+    if q32.numel() == 0:
+        return torch.empty((0,), dtype=torch.uint8)
+    q_min = int(q32.min().item())
+    q_max = int(q32.max().item())
+    if q_min < -INT6_MAX or q_max > INT6_MAX:
+        raise ValueError(f"int6 pack expected values in [-{INT6_MAX}, {INT6_MAX}], got [{q_min}, {q_max}]")
+    flat = q32.reshape(-1).numpy()
+    u = (flat + INT6_MAX).astype(np.uint32)  # shift to [0, 62], fits in 6 bits
     pad = (-len(u)) % 4
     if pad:
-        u = np.concatenate([u, np.zeros(pad, dtype=np.uint8)])
+        u = np.concatenate([u, np.zeros(pad, dtype=np.uint32)])
     u = u.reshape(-1, 4)
     out = np.empty((len(u), 3), dtype=np.uint8)
-    out[:, 0] = (u[:, 0] << 2) | (u[:, 1] >> 4)
-    out[:, 1] = ((u[:, 1] & 0xF) << 4) | (u[:, 2] >> 2)
-    out[:, 2] = ((u[:, 2] & 0x3) << 6) | u[:, 3]
+    out[:, 0] = (((u[:, 0] & 0x3F) << 2) | ((u[:, 1] & 0x3F) >> 4)).astype(np.uint8)
+    out[:, 1] = ((((u[:, 1] & 0xF) << 4) | ((u[:, 2] & 0x3F) >> 2))).astype(np.uint8)
+    out[:, 2] = ((((u[:, 2] & 0x3) << 6) | (u[:, 3] & 0x3F))).astype(np.uint8)
     return torch.from_numpy(out.reshape(-1)).contiguous()
 
 
 def unpack_int6_tensor(packed: Tensor, numel: int) -> Tensor:
     """Unpack uint8 packed bytes back to int8 tensor of int6 values [-31, 31]."""
-    d = packed.numpy().reshape(-1, 3)
-    u = np.empty((len(d), 4), dtype=np.uint8)
+    if numel < 0:
+        raise ValueError(f"int6 unpack expected non-negative numel, got {numel}")
+    if numel == 0:
+        return torch.empty((0,), dtype=torch.int8)
+    packed_u8 = packed.detach().to("cpu", dtype=torch.uint8).contiguous()
+    if packed_u8.numel() % 3 != 0:
+        raise RuntimeError(f"int6 packed tensor byte-length must be divisible by 3, got {packed_u8.numel()}")
+    d = packed_u8.numpy().astype(np.uint32).reshape(-1, 3)
+    u = np.empty((len(d), 4), dtype=np.uint32)
     u[:, 0] = d[:, 0] >> 2
     u[:, 1] = ((d[:, 0] & 0x3) << 4) | (d[:, 1] >> 4)
     u[:, 2] = ((d[:, 1] & 0xF) << 2) | (d[:, 2] >> 6)
     u[:, 3] = d[:, 2] & 0x3F
-    vals = u.reshape(-1)[:numel].astype(np.int32) - INT6_MAX
+    u_flat = u.reshape(-1)[:numel]
+    if int(u_flat.max(initial=0)) > 62:
+        raise RuntimeError("int6 unpack produced out-of-range unsigned value (>62)")
+    vals = u_flat.astype(np.int32) - INT6_MAX
     return torch.from_numpy(vals.astype(np.int8)).contiguous()
+
+
+def assert_int6_pack_roundtrip_exact() -> None:
+    gen = torch.Generator().manual_seed(12345)
+    lengths = [1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 511, 512, 513]
+    for n in lengths:
+        x = torch.randint(-INT6_MAX, INT6_MAX + 1, (n,), dtype=torch.int32, generator=gen)
+        y = unpack_int6_tensor(pack_int6_tensor(x), n).to(dtype=torch.int32)
+        if not torch.equal(x, y):
+            max_abs = int((x - y).abs().max().item())
+            raise RuntimeError(f"int6 pack/unpack mismatch len={n} max_abs={max_abs}")
+
+
+def int6_quant_dequant_sanity() -> tuple[float, float]:
+    gen = torch.Generator().manual_seed(23456)
+    t = torch.randn((257, 263), dtype=torch.float32, generator=gen)
+    q, s = quantize_float_tensor_int6(t)
+    q_rt = unpack_int6_tensor(pack_int6_tensor(q), q.numel()).reshape_as(q).float()
+    s32 = s.to(dtype=torch.float32)
+    dq = q_rt * s32[:, None] if s32.ndim > 0 else q_rt * float(s32.item())
+    err = (dq - t).abs()
+    return float(err.mean().item()), float(err.max().item())
 
 def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8):
     # Export format:
@@ -1277,6 +1316,11 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    if args.export_bits == 6:
+        assert_int6_pack_roundtrip_exact()
+        mae, max_abs = int6_quant_dequant_sanity()
+        log0(f"int6_sanity pack_roundtrip:ok mae:{mae:.6e} max_abs:{max_abs:.6e}")
 
     quant_obj, quant_stats = quantize_state_dict(base_model.state_dict(), args.export_bits)
     quant_buf = io.BytesIO()
