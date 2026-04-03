@@ -86,6 +86,15 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Compression-aware training
+    compression_reg_lambda = float(os.environ.get("COMPRESSION_REG_LAMBDA", 0.0))
+    compression_reg_start_step = int(os.environ.get("COMPRESSION_REG_START_STEP", 400))
+    compression_reg_every = int(os.environ.get("COMPRESSION_REG_EVERY", 8))
+    compression_reg_qerr = float(os.environ.get("COMPRESSION_REG_QERR", 1.0))
+    compression_reg_local = float(os.environ.get("COMPRESSION_REG_LOCAL", 0.05))
+    compression_reg_scale = float(os.environ.get("COMPRESSION_REG_SCALE", 0.01))
+    compression_reg_target = os.environ.get("COMPRESSION_REG_TARGET", "mlp")
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -420,6 +429,87 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+# -----------------------------
+# COMPRESSION-AWARE REGULARIZER
+# -----------------------------
+
+def fake_quantize_matrix_per_row_ste(t: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Per-row fake quantization with straight-through gradients.
+    Returns:
+      dq: dequantized tensor with STE
+      q_ste: quantized int8-like values in float domain with STE
+      scale: per-row scale
+    """
+    t32 = t.float()
+    if t32.ndim != 2:
+        raise ValueError("fake_quantize_matrix_per_row_ste expects a 2D tensor")
+
+    clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+    clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+    scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+
+    q_float = clipped / scale[:, None]
+    q_ste = q_float + (torch.round(q_float) - q_float).detach()
+    q_ste = torch.clamp(q_ste, -127.0, 127.0)
+
+    dq = q_ste * scale[:, None]
+    dq = t + (dq.to(dtype=t.dtype) - t).detach()
+    return dq, q_ste, scale
+
+
+def should_target_for_compression(name: str, param: Tensor, target: str) -> bool:
+    if param.ndim != 2:
+        return False
+    if param.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        return False
+
+    if target == "mlp":
+        return ("mlp.fc.weight" in name) or ("mlp.proj.weight" in name)
+    if target == "attn":
+        return (
+            ("attn.c_q.weight" in name)
+            or ("attn.c_k.weight" in name)
+            or ("attn.c_v.weight" in name)
+            or ("attn.proj.weight" in name)
+        )
+    if target == "all":
+        return True
+    return False
+
+
+def compression_regularizer(model: nn.Module, args: Hyperparameters) -> Tensor:
+    device = next(model.parameters()).device
+    total = torch.zeros((), device=device, dtype=torch.float32)
+    count = 0
+
+    for name, param in model.named_parameters():
+        if not should_target_for_compression(name, param, args.compression_reg_target):
+            continue
+
+        dq, q_ste, scale = fake_quantize_matrix_per_row_ste(param)
+
+        qerr = F.mse_loss(param.float(), dq.float())
+        local = (q_ste[:, 1:] - q_ste[:, :-1]).abs().mean() / 127.0
+
+        if scale.numel() > 1:
+            scale_smooth = (scale[1:] - scale[:-1]).abs().mean() / (scale.mean().detach() + 1e-8)
+        else:
+            scale_smooth = torch.zeros((), device=device, dtype=torch.float32)
+
+        total = total + (
+            args.compression_reg_qerr * qerr
+            + args.compression_reg_local * local
+            + args.compression_reg_scale * scale_smooth
+        )
+        count += 1
+
+    if count == 0:
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    return total / count
 
 
 # -----------------------------
@@ -1008,13 +1098,24 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        reg_loss = torch.zeros((), device=device, dtype=torch.float32)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                ce_loss = model(x, y)
+
+            if (
+                args.compression_reg_lambda > 0.0
+                and step >= args.compression_reg_start_step
+                and (step % max(args.compression_reg_every, 1) == 0)
+                and micro_step == grad_accum_steps - 1
+            ):
+                reg_loss = compression_regularizer(base_model, args)
+
+            loss = ce_loss + args.compression_reg_lambda * reg_loss
+            train_loss += ce_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
@@ -1042,7 +1143,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                + (f"reg_loss:{reg_loss.item():.6f} " if args.compression_reg_lambda > 0.0 else "")
+                + f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
