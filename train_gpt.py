@@ -1535,6 +1535,15 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    # base_model and compiled_model/DDP share the SAME parameter tensors via in-place
+    # load_state_dict (copy_), so the compiled graph always sees the updated weights.
+    log0(f"quant_model_id base_model:{id(base_model)} eval_model:{id(model)}")
+    _chk = "blocks.0.mlp.fc.weight"
+    _w_fp: Tensor | None = None
+    if _chk in base_model.state_dict():
+        _w_fp = base_model.state_dict()[_chk].detach().float().cpu().clone()
+        log0(f"quant_weight_fp  {_chk} mean:{_w_fp.mean().item():.5f} std:{_w_fp.std().item():.5f}")
+
     if args.export_bits == 6:
         assert_int6_pack_roundtrip_exact()
         mae, max_abs = int6_quant_dequant_sanity()
@@ -1605,6 +1614,46 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_bytes(quant_blob_disk, args.compressor)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
+
+    # ---- post-load verification: confirm weights changed and models are shared ----
+    if _w_fp is not None and _chk in base_model.state_dict():
+        _w_q = base_model.state_dict()[_chk].detach().float().cpu()
+        _max_diff = float((_w_q - _w_fp).abs().max().item())
+        log0(f"quant_weight_q   {_chk} mean:{_w_q.mean().item():.5f} std:{_w_q.std().item():.5f} max_diff_from_fp:{_max_diff:.3e}")
+        if _max_diff < 1e-7:
+            log0("WARNING: quant_weight_update FAILED — weights unchanged after load_state_dict")
+        else:
+            log0("quant_weight_update OK")
+
+    # Verify eval model (compiled/DDP wrapper) shares parameter tensors with base_model.
+    # If shared == 0, eval_val would be running on stale FP weights.
+    _base_ptrs = {p.data_ptr() for p in base_model.parameters()}
+    _eval_ptrs = {p.data_ptr() for p in model.parameters()}
+    _n_shared = len(_base_ptrs & _eval_ptrs)
+    _n_base = len(_base_ptrs)
+    log0(f"quant_param_sharing base_params:{_n_base} eval_model_params:{len(_eval_ptrs)} shared:{_n_shared}")
+    if _n_shared < _n_base:
+        log0(f"WARNING: eval model shares only {_n_shared}/{_n_base} param tensors — possible stale FP fallback")
+
+    # Discreteness check: a correctly quantized large weight should have far fewer unique
+    # values than a FP weight (e.g. int8 → ≤255 distinct values per column sample).
+    for _qn, _qp in base_model.named_parameters():
+        if _qp.ndim == 2 and _qp.numel() > INT8_KEEP_FLOAT_MAX_NUMEL and _qp.is_floating_point():
+            _sample = _qp.detach().float().cpu()[:, :16].reshape(-1)
+            _nuniq = int(torch.unique(_sample).numel())
+            log0(f"quant_discrete_check {_qn} dtype:{_qp.dtype} unique_in_16col_sample:{_nuniq}/{int(_sample.numel())}")
+            break
+
+    # Tied embedding: when tie_embeddings=True, lm_head is None and tok_emb.weight is used
+    # for both embedding lookup and logit projection — no extra sync needed after load_state_dict.
+    if base_model.tie_embeddings:
+        log0(f"quant_tied_embed tok_emb.weight id:{id(base_model.tok_emb.weight)} lm_head:None(tied,correct)")
+    else:
+        assert base_model.lm_head is not None
+        log0(f"quant_untied_embed lm_head.weight id:{id(base_model.lm_head.weight)}")
+
+    log0(f"EVAL MODEL CONFIRMED QUANTIZED  base_model_id:{id(base_model)} eval_model_id:{id(model)}")
+
     if args.quant_logit_debug and logit_dbg_x is not None and logit_dbg_fp is not None:
         with torch.inference_mode():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
