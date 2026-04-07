@@ -90,6 +90,7 @@ class Hyperparameters:
     # Export quantization and compression
     export_bits = int(os.environ.get("EXPORT_BITS", 8))
     compressor = os.environ.get("COMPRESSOR", "zlib")
+    byte_shuffle = bool(int(os.environ.get("BYTE_SHUFFLE", "0")))
     # GPTQ-lite calibration (int6 only, disabled by default)
     gptq_enable = bool(int(os.environ.get("GPTQ_ENABLE", "0")))
     gptq_targets = os.environ.get("GPTQ_TARGETS", "mlp")
@@ -900,7 +901,43 @@ def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-def compress_bytes(data: bytes, compressor: str) -> bytes:
+def byte_shuffle_encode(data: bytes) -> bytes:
+    """Transpose the byte array so byte-N of every 4-byte float is contiguous.
+    This groups identical exponent/mantissa bytes together, which dramatically
+    improves compression ratio for quantized weight blobs.
+    Inverse: byte_shuffle_decode(byte_shuffle_encode(data)) == data exactly.
+    """
+    n = len(data)
+    stride = 4
+    # Pad to a multiple of stride for safe reshape, remember real length.
+    pad = (-n) % stride
+    padded = data + b"\x00" * pad
+    arr = np.frombuffer(padded, dtype=np.uint8).reshape(-1, stride)
+    shuffled = arr.T.ravel().tobytes()
+    # Prepend original length (8 bytes, little-endian) so decode knows where to trim.
+    return n.to_bytes(8, "little") + shuffled
+
+
+def byte_shuffle_decode(data: bytes) -> bytes:
+    """Inverse of byte_shuffle_encode."""
+    orig_len = int.from_bytes(data[:8], "little")
+    shuffled = np.frombuffer(data[8:], dtype=np.uint8)
+    stride = 4
+    n_cols = len(shuffled) // stride
+    arr = shuffled.reshape(stride, n_cols).T.ravel().tobytes()
+    return arr[:orig_len]
+
+
+def _assert_byte_shuffle_roundtrip() -> None:
+    import os as _os
+    test = _os.urandom(1031)  # odd length to exercise padding
+    assert byte_shuffle_decode(byte_shuffle_encode(test)) == test, \
+        "byte_shuffle roundtrip FAILED"
+
+
+def compress_bytes(data: bytes, compressor: str, shuffle: bool = False) -> bytes:
+    if shuffle:
+        data = byte_shuffle_encode(data)
     if compressor == "zlib":
         return zlib.compress(data, level=9)
     if compressor == "lzma":
@@ -911,21 +948,37 @@ def compress_bytes(data: bytes, compressor: str) -> bytes:
         except ImportError:
             raise ImportError("zstd compressor requires the 'zstandard' package: pip install zstandard") from None
         return zstd.ZstdCompressor(level=19).compress(data)
-    raise ValueError(f"Unknown compressor '{compressor}'; supported: zlib, lzma, zstd")
+    if compressor == "brotli":
+        try:
+            import brotli
+        except ImportError:
+            raise ImportError("brotli compressor requires the 'brotli' package: pip install brotli") from None
+        return brotli.compress(data, quality=11)
+    raise ValueError(f"Unknown compressor '{compressor}'; supported: zlib, lzma, zstd, brotli")
 
 
-def decompress_bytes(data: bytes, compressor: str) -> bytes:
+def decompress_bytes(data: bytes, compressor: str, shuffle: bool = False) -> bytes:
     if compressor == "zlib":
-        return zlib.decompress(data)
-    if compressor == "lzma":
-        return lzma.decompress(data)
-    if compressor == "zstd":
+        out = zlib.decompress(data)
+    elif compressor == "lzma":
+        out = lzma.decompress(data)
+    elif compressor == "zstd":
         try:
             import zstandard as zstd
         except ImportError:
             raise ImportError("zstd compressor requires the 'zstandard' package: pip install zstandard") from None
-        return zstd.ZstdDecompressor().decompress(data)
-    raise ValueError(f"Unknown compressor '{compressor}'; supported: zlib, lzma, zstd")
+        out = zstd.ZstdDecompressor().decompress(data)
+    elif compressor == "brotli":
+        try:
+            import brotli
+        except ImportError:
+            raise ImportError("brotli compressor requires the 'brotli' package: pip install brotli") from None
+        out = brotli.decompress(data)
+    else:
+        raise ValueError(f"Unknown compressor '{compressor}'; supported: zlib, lzma, zstd, brotli")
+    if shuffle:
+        out = byte_shuffle_decode(out)
+    return out
 
 
 # -----------------------------
@@ -1744,12 +1797,15 @@ def main() -> None:
                 f"stored_s_dtype:{_rs.dtype} stored_s_shape:{tuple(_rs.shape)} "
                 f"meta:{_rm}"
             )
+    if args.byte_shuffle:
+        _assert_byte_shuffle_roundtrip()
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = compress_bytes(quant_raw, args.compressor)
+    quant_blob = compress_bytes(quant_raw, args.compressor, shuffle=args.byte_shuffle)
     quant_raw_bytes = len(quant_raw)
-    artifact_name = f"final_model.int{args.export_bits}.{args.compressor}.ptz"
+    _shuf_tag = "_shuf" if args.byte_shuffle else ""
+    artifact_name = f"final_model.int{args.export_bits}.{args.compressor}{_shuf_tag}.ptz"
     if master_process:
         with open(artifact_name, "wb") as f:
             f.write(quant_blob)
@@ -1757,7 +1813,8 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["payload_bytes"], 1)
         log0(
-            f"Serialized model int{args.export_bits}+{args.compressor}: {quant_file_bytes} bytes "
+            f"Serialized model int{args.export_bits}+{args.compressor} byte_shuffle:{args.byte_shuffle}: "
+            f"{quant_file_bytes} bytes "
             f"(payload:{quant_stats['payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         if quant_stats["sweep_candidates"] > 1:
@@ -1790,7 +1847,7 @@ def main() -> None:
         dist.barrier()
     with open(artifact_name, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(decompress_bytes(quant_blob_disk, args.compressor)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(decompress_bytes(quant_blob_disk, args.compressor, shuffle=args.byte_shuffle)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
 
     # ---- post-load verification: confirm weights changed and models are shared ----
