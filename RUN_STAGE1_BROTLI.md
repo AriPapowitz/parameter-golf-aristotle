@@ -1,100 +1,67 @@
-# Stage 1 — Brotli + Byte-Shuffle Smoke Test
+# Canonical Control + Stage 1 Runbook
 
-## 1. Local commit and push
+## Baseline control command (600s)
 
-```bash
-git add train_gpt.py PORT_PR1218_PLAN.md RUN_STAGE1_BROTLI.md
-git commit -m "Stage 1: brotli compressor + byte-shuffle exporter (pr1218_port)"
-git push -u origin pr1218_port
-```
-
----
-
-## 2. Pod: pull the branch
+Run this exact command with only `SEED` and `RUN_ID` changed:
 
 ```bash
-cd ~/parameter-golf
-git fetch origin
-git checkout pr1218_port
-git pull origin pr1218_port
-pip install brotli          # only needed for COMPRESSOR=brotli
-# pip install zstandard     # already installed if using zstd elsewhere
-```
-
----
-
-## 3. Smoke test — 120 s, existing 1024-vocab dataset, brotli + byte-shuffle
-
-```bash
-RUN_ID=stage1_brotli_smoke \
+RUN_ID=control_seed42 \
+SEED=42 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
-MAX_WALLCLOCK_SECONDS=120 \
+MAX_WALLCLOCK_SECONDS=600 \
 VAL_LOSS_EVERY=0 \
 EXPORT_BITS=6 \
 COMPRESSOR=brotli \
 BYTE_SHUFFLE=1 \
+GPTQ_ENABLE=1 \
+GPTQ_TARGETS=mlp,attn \
+GPTQ_CALIB_MODE=train \
+GPTQ_CALIB_BATCHES=64 \
+GPTQ_MAX_ROWS=12000 \
+GPTQ_BLOCK_SIZE=128 \
+GPTQ_DAMPING=0.0002 \
+QUANT_BITS_BY_PATTERN="attn.c_q:8,attn.c_k:8,attn.c_v:8,attn.proj:8,mlp.fc:6,mlp.proj:8" \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
-### Expected log lines to look for
+Second control is identical except:
+- `RUN_ID=control_seed314`
+- `SEED=314`
 
-```
-Serialized model int6+brotli byte_shuffle:True: ... bytes ...
-```
+## Stage 1 GPTQ grid bundle
 
-Artifact file will be named: `final_model.int6.brotli_shuf.ptz`
-
----
-
-## 4. Verification greps (run from repo root)
+Keep the baseline command and override one variable at a time:
 
 ```bash
-# Confirm brotli branch exists in compress_bytes
-grep -n "brotli" train_gpt.py
+# A) rows sweep
+RUN_ID=s1_rows8k   GPTQ_MAX_ROWS=8000   SEED=42 ...
+RUN_ID=s1_rows12k  GPTQ_MAX_ROWS=12000  SEED=42 ...
+RUN_ID=s1_rows16k  GPTQ_MAX_ROWS=16000  SEED=42 ...
 
-# Confirm byte_shuffle functions exist
-grep -n "byte_shuffle" train_gpt.py
+# B) calib batches
+RUN_ID=s1_calib64  GPTQ_CALIB_BATCHES=64 SEED=42 ...
+RUN_ID=s1_calib96  GPTQ_CALIB_BATCHES=96 SEED=42 ...
 
-# Confirm shuffle flag is threaded through compress call
-grep -n "shuffle=args.byte_shuffle" train_gpt.py
+# C) block size
+RUN_ID=s1_blk128 GPTQ_BLOCK_SIZE=128 SEED=42 ...
+RUN_ID=s1_blk96  GPTQ_BLOCK_SIZE=96  SEED=42 ...
 
-# Confirm sanity check is called before export
-grep -n "_assert_byte_shuffle_roundtrip" train_gpt.py
+# D) damping
+RUN_ID=s1_damp1e4 GPTQ_DAMPING=0.0001 SEED=42 ...
+RUN_ID=s1_damp2e4 GPTQ_DAMPING=0.0002 SEED=42 ...
 
-# Confirm Hyperparameter exists
-grep -n "BYTE_SHUFFLE" train_gpt.py
-
-# Confirm plan file is present
-ls PORT_PR1218_PLAN.md RUN_STAGE1_BROTLI.md
+# E) mlp.proj int8 vs int6
+RUN_ID=s1_mlp_proj8 QUANT_BITS_BY_PATTERN="attn.c_q:8,attn.c_k:8,attn.c_v:8,attn.proj:8,mlp.fc:6,mlp.proj:8" ...
+RUN_ID=s1_mlp_proj6 QUANT_BITS_BY_PATTERN="attn.c_q:8,attn.c_k:8,attn.c_v:8,attn.proj:8,mlp.fc:6,mlp.proj:6" ...
 ```
 
----
+Use the command prefix from baseline; replace `...` with the rest of that baseline command.
 
-## 5. Quick sanity — zlib baseline (verify no regression)
+## Metrics to archive per run
 
-```bash
-RUN_ID=stage1_zlib_baseline \
-DATA_PATH=./data/datasets/fineweb10B_sp1024 \
-TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
-VOCAB_SIZE=1024 \
-MAX_WALLCLOCK_SECONDS=120 \
-VAL_LOSS_EVERY=0 \
-EXPORT_BITS=6 \
-COMPRESSOR=zlib \
-BYTE_SHUFFLE=0 \
-torchrun --standalone --nproc_per_node=1 train_gpt.py
-```
-
-This should behave identically to the previous branch (artifact: `final_model.int6.zlib.ptz`).
-
----
-
-## 6. Notes
-
-- If `brotli` is not installed you will see a clear error:
-  `ImportError: brotli compressor requires the 'brotli' package: pip install brotli`
-- The `byte_shuffle` roundtrip sanity check fires once before compression; it uses `os.urandom`
-  on 1031 bytes (odd length to exercise padding). If it fails, the run aborts immediately.
-- `BYTE_SHUFFLE=1` can be combined with any compressor (`zlib`, `lzma`, `zstd`, `brotli`).
+- `step:... val_bpb:...` (best pre-quant)
+- `final_int*_roundtrip_exact val_bpb:...`
+- `quant_summary ... worst_rel_mse_top10:...`
+- `Total submission size ...`

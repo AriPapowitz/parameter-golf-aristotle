@@ -1,0 +1,3 @@
+run_id,seed,stage,pre_quant_val_bpb,final_roundtrip_val_bpb,worst_rel_mse_top,submission_bytes,notes
+control_seed42,42,0,,,,,
+control_seed314,314,0,,,,,

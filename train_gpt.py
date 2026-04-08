@@ -38,11 +38,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
+    use_vocab4096 = bool(int(os.environ.get("USE_VOCAB4096", "0")))
+    _default_data_path = "./data/datasets/fineweb10B_sp4096" if use_vocab4096 else "./data/datasets/fineweb10B_sp1024"
+    _default_tokenizer_path = "./data/tokenizers/fineweb_4096_bpe.model" if use_vocab4096 else "./data/tokenizers/fineweb_1024_bpe.model"
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", _default_data_path)
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", _default_tokenizer_path)
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -61,7 +64,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096 if use_vocab4096 else 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -80,6 +83,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -100,6 +104,11 @@ class Hyperparameters:
     gptq_max_rows = int(os.environ.get("GPTQ_MAX_ROWS", 4096))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     gptq_damping = float(os.environ.get("GPTQ_DAMPING", 1e-4))
+    gptq_order_by_diag = bool(int(os.environ.get("GPTQ_ORDER_BY_DIAG", "1")))
+    gptq_hessian_fp64 = bool(int(os.environ.get("GPTQ_HESSIAN_FP64", "1")))
+    gptq_calib_mode = os.environ.get("GPTQ_CALIB_MODE", "train")  # train|ar
+    gptq_ar_batch_size = int(os.environ.get("GPTQ_AR_BATCH_SIZE", 8))
+    gptq_ar_seq_len = int(os.environ.get("GPTQ_AR_SEQ_LEN", 256))
     quant_clip_candidates = [
         float(v) for v in os.environ.get(
             "QUANT_CLIP_CANDIDATES", "0.995,0.999,0.9995,0.9999,0.999998"
@@ -114,13 +123,25 @@ class Hyperparameters:
     quant_only_patterns = tuple(
         p for p in os.environ.get("QUANT_ONLY_PATTERNS", "").split(",") if p.strip()
     )
+    # Default mixed-precision quantization map (first match wins).
+    QUANT_RULES = {
+        "attn.c_q": 8,
+        "attn.c_k": 8,
+        "attn.c_v": 8,
+        "mlp.fc": 6,
+        "mlp.proj": 8,
+    }
+    _default_quant_bits_by_pattern = ",".join(f"{k}:{v}" for k, v in QUANT_RULES.items())
     quant_bits_by_pattern = tuple(
         (pat.strip(), int(b.strip()))
-        for rule in os.environ.get("QUANT_BITS_BY_PATTERN", "").split(",")
+        for rule in os.environ.get("QUANT_BITS_BY_PATTERN", _default_quant_bits_by_pattern).split(",")
         if rule.strip()
         for pat, b in [rule.split(":", 1)]
         if pat.strip() and b.strip()
     )
+    # Data loader traversal mode.
+    train_loader_mode = os.environ.get("TRAIN_LOADER_MODE", "sequential")  # sequential|coprime
+    loader_coprime_stride = int(os.environ.get("LOADER_COPRIME_STRIDE", 7))
 
     # Compression-aware training
     compression_reg_lambda = float(os.environ.get("COMPRESSION_REG_LAMBDA", 0.0))
@@ -155,10 +176,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -180,6 +203,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            weight_decay = group.get("weight_decay", 0.0)
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -207,6 +231,8 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if weight_decay > 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -533,32 +559,54 @@ def should_target_for_gptq(name: str, param: Tensor, target: str) -> bool:
 
 
 def gptq_quantize_matrix_int6(
-    weight: Tensor, acts: Tensor, block_size: int, damping: float, clip_qs: list[float],
+    weight: Tensor,
+    acts: Tensor,
+    block_size: int,
+    damping: float,
+    clip_qs: list[float],
+    order_by_diag: bool = True,
+    hessian_fp64: bool = True,
 ) -> tuple[Tensor, Tensor, int]:
     """GPTQ int6 for weight:[out,in] with activations acts:[N,in]. Returns (q_int32, scale_fp16)."""
-    W, X = weight.detach().float(), acts.float()
+    W = weight.detach().float()
+    h_dtype = torch.float64 if hessian_fp64 else torch.float32
+    X = acts.to(dtype=h_dtype)
     out_f, in_f = W.shape
-    H = X.T @ X / max(X.shape[0], 1)
-    H.diagonal().add_(damping * H.diagonal().mean().clamp_min(1e-8).item())
+    H = (X.T @ X) / max(X.shape[0], 1)
+    diag = H.diagonal()
+    diag_mean = float(diag.mean().item()) if diag.numel() else 1.0
+    damp = max(float(damping) * max(diag_mean, 1e-8), 1e-8)
+    H.diagonal().add_(damp)
     try:
-        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        chol = torch.linalg.cholesky(H)
+        H_inv = torch.cholesky_inverse(chol)
     except torch.linalg.LinAlgError:
         H_inv = torch.linalg.pinv(H)
+    H_inv = H_inv.to(dtype=torch.float32)
     _, scale, best_idx = _clip_sweep_best(W, INT6_MAX, clip_qs)
     scale = scale.clamp_min(1.0 / INT6_MAX)
     W_upd, Q = W.clone(), torch.zeros(out_f, in_f, dtype=torch.int32)
-    for bs in range(0, in_f, block_size):
-        be = min(bs + block_size, in_f)
+    col_order = torch.arange(in_f, dtype=torch.long)
+    if order_by_diag and in_f > 1:
+        col_order = torch.argsort(H.diagonal().to(dtype=torch.float32), descending=True)
+    inv_order = torch.empty_like(col_order)
+    inv_order[col_order] = torch.arange(in_f, dtype=torch.long)
+    W_ord = W_upd[:, col_order]
+    H_inv_ord = H_inv[col_order][:, col_order]
+    Q_ord = torch.zeros_like(Q)
+    for bs in range(0, in_f, max(1, block_size)):
+        be = min(bs + max(1, block_size), in_f)
         err_b = torch.zeros(out_f, be - bs)
         for li, j in enumerate(range(bs, be)):
-            q_j = torch.clamp(torch.round(W_upd[:, j] / scale), -INT6_MAX, INT6_MAX).to(torch.int32)
-            err_j = W_upd[:, j] - q_j.float() * scale
-            Q[:, j] = q_j
+            q_j = torch.clamp(torch.round(W_ord[:, j] / scale), -INT6_MAX, INT6_MAX).to(torch.int32)
+            err_j = W_ord[:, j] - q_j.float() * scale
+            Q_ord[:, j] = q_j
             err_b[:, li] = err_j
-            if j + 1 < be and (h_jj := H_inv[j, j].item()) and abs(h_jj) > 1e-10:
-                W_upd[:, j+1:be] -= err_j[:, None] * (H_inv[j, j+1:be] / h_jj)
+            if j + 1 < be and (h_jj := H_inv_ord[j, j].item()) and abs(h_jj) > 1e-10:
+                W_ord[:, j + 1 : be] -= err_j[:, None] * (H_inv_ord[j, j + 1 : be] / h_jj)
         if be < in_f:
-            W_upd[:, be:] -= (err_b / H_inv.diagonal()[bs:be].clamp_min(1e-10)) @ H_inv[bs:be, be:]
+            W_ord[:, be:] -= (err_b / H_inv_ord.diagonal()[bs:be].clamp_min(1e-10)) @ H_inv_ord[bs:be, be:]
+    Q = Q_ord[:, inv_order]
     return Q.contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), best_idx
 
 
@@ -617,6 +665,72 @@ def _collect_calibration_acts(
     return bufs, matched, unmatched
 
 
+def _collect_calibration_acts_ar(
+    base_model: nn.Module,
+    args: Hyperparameters,
+    device: torch.device,
+    log_fn=None,
+) -> tuple[dict[str, Tensor], int, int]:
+    """Dataset-free calibration using autoregressive self-generated tokens."""
+    bufs: dict[str, Tensor] = {}
+    hooks = []
+    gen = torch.Generator().manual_seed(args.seed + 7331)
+    tlog = log_fn if log_fn is not None else print
+    matched = 0
+    unmatched = 0
+
+    def _append_capped(name: str, x: Tensor) -> None:
+        rows = x.detach().float().cpu().reshape(-1, x.shape[-1])
+        if rows.shape[0] > args.gptq_max_rows:
+            idx = torch.randperm(rows.shape[0], generator=gen)[: args.gptq_max_rows]
+            rows = rows[idx]
+        prev = bufs.get(name)
+        if prev is None:
+            bufs[name] = rows[: args.gptq_max_rows].contiguous()
+            return
+        cat = torch.cat((prev, rows), dim=0)
+        if cat.shape[0] > args.gptq_max_rows:
+            idx = torch.randperm(cat.shape[0], generator=gen)[: args.gptq_max_rows]
+            cat = cat[idx]
+        bufs[name] = cat.contiguous()
+
+    for n, m in base_model.named_modules():
+        pn = f"{n}.weight"
+        if isinstance(m, nn.Linear):
+            ok, reason = gptq_target_match(pn, m.weight, args.gptq_target_list)
+            if args.gptq_target_debug:
+                tlog(
+                    f"gptq_target_debug name:{pn} enabled:{args.gptq_enable} targets:{args.gptq_target_list} "
+                    f"matched:{ok} reason:{reason} route:{'gptq_calib_ar' if ok else 'not_targeted'}"
+                )
+            if ok:
+                matched += 1
+                hooks.append(m.register_forward_hook(
+                    lambda _, inp, __, _pn=pn: _append_capped(_pn, inp[0])))
+            else:
+                unmatched += 1
+    if not hooks:
+        return {}, matched, unmatched
+
+    base_model.eval()
+    seq_len = max(16, min(args.gptq_ar_seq_len, args.train_seq_len))
+    batch_size = max(1, args.gptq_ar_batch_size)
+    with torch.inference_mode():
+        x = torch.randint(0, args.vocab_size, (batch_size, seq_len), device=device, dtype=torch.int64)
+        for _ in range(args.gptq_calib_batches):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = forward_logits(base_model, x).float().view(batch_size, seq_len, args.vocab_size)
+            next_tok = logits[:, -1, :].argmax(dim=-1)
+            y = torch.cat((x[:, 1:], next_tok[:, None]), dim=1)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                base_model(x, y)
+            x = y
+    base_model.train()
+    for h in hooks:
+        h.remove()
+    return bufs, matched, unmatched
+
+
 def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: list[float] | None = None,
                         gptq_acts: dict[str, Tensor] | None = None, gptq_block_size: int = 128, gptq_damping: float = 1e-4,
                         quant_debug: bool = False, quant_skip_patterns: tuple[str, ...] = (),
@@ -624,7 +738,9 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
                         gptq_export_debug: bool = False,
                         quant_bits_by_pattern: tuple[tuple[str, int], ...] = (),
                         gptq_enabled: bool = False, gptq_target_list: tuple[str, ...] = (),
-                        gptq_target_debug: bool = False):
+                        gptq_target_debug: bool = False,
+                        gptq_order_by_diag: bool = True,
+                        gptq_hessian_fp64: bool = True):
     # Export format:
     # - per-row intN for 2D float tensors (int8 stored as int8, int6 packed into uint8)
     # - per-tensor intN for other float tensors
@@ -762,7 +878,15 @@ def quantize_state_dict(state_dict: dict[str, Tensor], bits: int = 8, clip_qs: l
                 f"matched:{tgt_ok} reason:{tgt_reason} chosen_bits:{chosen_bits} bits_src:{bits_src} route:{route_reason}"
             )
         if use_gptq:
-            q_raw, s, best_idx = gptq_quantize_matrix_int6(t.float(), gptq_acts[name], gptq_block_size, gptq_damping, cqs)
+            q_raw, s, best_idx = gptq_quantize_matrix_int6(
+                t.float(),
+                gptq_acts[name],
+                gptq_block_size,
+                gptq_damping,
+                cqs,
+                order_by_diag=gptq_order_by_diag,
+                hessian_fp64=gptq_hessian_fp64,
+            )
             gptq_count += 1
             if len(gptq_names) < 5:
                 gptq_names.append(name)
@@ -1086,16 +1210,32 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, mode: str = "sequential", coprime_stride: int = 7):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.mode = mode
+        self.coprime_stride = coprime_stride
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self._visit_step = 0
+
+    def _next_file_idx(self) -> int:
+        n = len(self.files)
+        if self.mode != "coprime" or n <= 1:
+            return (self.file_idx + 1) % n
+        stride = max(1, abs(int(self.coprime_stride)))
+        if math.gcd(stride, n) != 1:
+            for cand in range(stride, stride + n + 1):
+                if math.gcd(cand, n) == 1:
+                    stride = cand
+                    break
+        self._visit_step += 1
+        return (self.file_idx + stride) % n
 
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_idx = self._next_file_idx()
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -1117,11 +1257,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, mode: str = "sequential", coprime_stride: int = 7):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, mode=mode, coprime_stride=coprime_stride)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -1373,6 +1513,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.gptq_calib_mode not in {"train", "ar"}:
+        raise ValueError(f"GPTQ_CALIB_MODE must be one of [train, ar], got {args.gptq_calib_mode}")
+    if args.train_loader_mode not in {"sequential", "coprime"}:
+        raise ValueError(f"TRAIN_LOADER_MODE must be one of [sequential, coprime], got {args.train_loader_mode}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1513,6 +1657,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1540,7 +1685,11 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} muon_weight_decay:{args.muon_weight_decay}"
+    )
+    log0(
+        f"train_loader_mode:{args.train_loader_mode} loader_coprime_stride:{args.loader_coprime_stride} "
+        f"use_vocab4096:{args.use_vocab4096}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1553,7 +1702,14 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        mode=args.train_loader_mode,
+        coprime_stride=args.loader_coprime_stride,
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1598,7 +1754,14 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            mode=args.train_loader_mode,
+            coprime_stride=args.loader_coprime_stride,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1753,14 +1916,19 @@ def main() -> None:
     gptq_calib_matched = 0
     gptq_calib_unmatched = 0
     if args.export_bits == 6 and args.gptq_enable:
-        gptq_acts, gptq_calib_matched, gptq_calib_unmatched = _collect_calibration_acts(
-            base_model, train_loader, args, grad_accum_steps, log0
-        )
+        if args.gptq_calib_mode == "ar":
+            gptq_acts, gptq_calib_matched, gptq_calib_unmatched = _collect_calibration_acts_ar(
+                base_model, args, device, log0
+            )
+        else:
+            gptq_acts, gptq_calib_matched, gptq_calib_unmatched = _collect_calibration_acts(
+                base_model, train_loader, args, grad_accum_steps, log0
+            )
         if gptq_acts:
             row_counts = [int(v.shape[0]) for v in gptq_acts.values()]
             preview = ", ".join(f"{k}:{int(v.shape[0])}" for k, v in list(gptq_acts.items())[:3])
             log0(
-                f"gptq_calib tensors:{len(gptq_acts)} rows_min:{min(row_counts)} rows_max:{max(row_counts)} "
+                f"gptq_calib mode:{args.gptq_calib_mode} tensors:{len(gptq_acts)} rows_min:{min(row_counts)} rows_max:{max(row_counts)} "
                 f"preview:{preview}"
             )
     quant_obj, quant_stats = quantize_state_dict(
@@ -1769,6 +1937,7 @@ def main() -> None:
         args.quant_debug, args.quant_skip_patterns, args.quant_only_patterns, log0,
         args.gptq_export_debug, args.quant_bits_by_pattern,
         args.gptq_enable, args.gptq_target_list, args.gptq_target_debug,
+        args.gptq_order_by_diag, args.gptq_hessian_fp64,
     )
     # ---- pre-save byte audit (always printed, component breakdown is cheap) ----
     _obj_q_bytes = sum(tensor_nbytes(v) for v in quant_obj["quantized"].values())
